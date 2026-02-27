@@ -12,12 +12,10 @@ from einops import rearrange, repeat
 from torch.nn import functional as F
 
 from fla.layers.utils import get_unpad_data, index_first_axis, pad_input
-from fla.modules import FusedRMSNormGated, RMSNorm, ShortConvolution
-from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
+from fla.ops.gated_delta_rule.naive import naive_chunk_gated_delta_rule, naive_recurrent_gated_delta_rule
 
 if TYPE_CHECKING:
     from transformers.processing_utils import Unpack
-
     from fla.models.utils import Cache
 
 
@@ -29,6 +27,92 @@ def elu_p1(x):
 @torch.compile
 def sum_norm(x):
     return (x / x.sum(-1, keepdim=True)).to(x)
+
+
+class ShortConvolution(nn.Conv1d):
+    def __init__(
+        self,
+        hidden_size: int,
+        kernel_size: int,
+        bias: bool = False,
+        activation: str | None = 'silu',
+        **kwargs,
+    ):
+        super().__init__(
+            in_channels=hidden_size,
+            out_channels=hidden_size,
+            kernel_size=kernel_size,
+            groups=hidden_size,
+            bias=bias,
+            padding=kernel_size - 1,
+        )
+        self.activation = activation
+        
+    def forward(
+        self,
+        x: torch.Tensor,
+        cache: torch.Tensor | None = None,
+        output_final_state: bool = False,
+        cu_seqlens: torch.LongTensor | None = None,
+        **kwargs,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        B, T, D = x.shape
+        if T == 1 and cache is not None:
+            cache = torch.cat([cache[:, :, 1:], x.transpose(1, 2)], dim=-1)
+            y = torch.sum(cache * rearrange(self.weight, "d 1 w -> d w"), dim=-1)
+            if self.bias is not None:
+                y = y + self.bias
+            if self.activation in ['silu', 'swish']:
+                y = F.silu(y)
+            return y.unsqueeze(1), cache
+        
+        x_t = x.transpose(1, 2)
+        if cache is not None:
+            x_t = torch.cat([cache, x_t], dim=-1)
+            y = F.conv1d(x_t, self.weight, self.bias, groups=self.groups)
+            if self.kernel_size[0] > 1:
+                y = y[..., :-self.kernel_size[0]+1]
+        else:
+            y = super().forward(x_t)
+            y = y[..., :T]
+        
+        if self.activation in ['silu', 'swish']:
+            y = F.silu(y)
+            
+        new_cache = None
+        if output_final_state:
+            k = self.kernel_size[0]
+            if cache is None:
+                if T >= k - 1:
+                    new_cache = x_t[..., -k+1:]
+                else:
+                    pad = torch.zeros(B, D, k - 1 - T, device=x.device, dtype=x.dtype)
+                    new_cache = torch.cat([pad, x_t], dim=-1)
+            else:
+                new_cache = x_t[..., -k+1:]
+                
+        return y.transpose(1, 2), new_cache
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-5, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x, **kwargs):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+
+
+class FusedRMSNormGated(nn.Module):
+    def __init__(self, hidden_size, eps=1e-5, **kwargs):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = eps
+
+    def forward(self, x, g, **kwargs):
+        normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps) * self.weight
+        return normed * g * torch.sigmoid(g)
 
 
 class GatedDeltaNet(nn.Module):
@@ -270,8 +354,13 @@ class GatedDeltaNet(nn.Module):
         g = -self.A_log.float().exp() * F.softplus(self.a_proj(hidden_states).float() + self.dt_bias)
 
         recurrent_state = last_state['recurrent_state'] if last_state is not None else None
+        
+        # Apply L2 norm since use_qk_l2norm_in_kernel=True was previously used
+        q = F.normalize(q, p=2.0, dim=-1, eps=1e-6)
+        k = F.normalize(k, p=2.0, dim=-1, eps=1e-6)
+
         if mode == 'chunk':
-            o, recurrent_state = chunk_gated_delta_rule(
+            o, recurrent_state = naive_chunk_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
@@ -279,11 +368,9 @@ class GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
             )
         elif mode == 'fused_recurrent':
-            o, recurrent_state = fused_recurrent_gated_delta_rule(
+            o, recurrent_state = naive_recurrent_gated_delta_rule(
                 q=q,
                 k=k,
                 v=v,
@@ -291,8 +378,6 @@ class GatedDeltaNet(nn.Module):
                 beta=beta,
                 initial_state=recurrent_state,
                 output_final_state=use_cache,
-                cu_seqlens=cu_seqlens,
-                use_qk_l2norm_in_kernel=True,
             )
         else:
             raise NotImplementedError(f"Not supported mode `{mode}`.")
