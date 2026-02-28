@@ -33,6 +33,21 @@ def naive_recurrent_gated_delta_rule(
         final_state: [B, H, K, V] if output_final_state else None
     """
     q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
+
+    HQ = q.shape[1]
+    HV = v.shape[1]
+    H = max(HQ, HV)
+    if HQ != HV:
+        if H % HQ != 0 or H % HV != 0:
+            raise ValueError(f"Number of heads in q/k ({HQ}) and v/beta/g ({HV}) must be divisible by each other.")
+        if HQ < H:
+            q = q.repeat_interleave(H // HQ, dim=1)
+            k = k.repeat_interleave(H // HQ, dim=1)
+        if HV < H:
+            v = v.repeat_interleave(H // HV, dim=1)
+            beta = beta.repeat_interleave(H // HV, dim=1)
+            g = g.repeat_interleave(H // HV, dim=1)
+
     B, H, T, K, V = *k.shape, v.shape[-1]
     o = torch.zeros(B, H, T, V).to(v)
     h = torch.zeros(B, H, K, V).to(v)
@@ -93,6 +108,20 @@ def naive_chunk_gated_delta_rule(
         scale = 1 / (q.shape[-1] ** 0.5)
 
     q, k, v, beta, g = map(lambda x: x.transpose(1, 2).contiguous().to(torch.float32), [q, k, v, beta, g])
+
+    HQ = q.shape[1]
+    HV = v.shape[1]
+    H = max(HQ, HV)
+    if HQ != HV:
+        if H % HQ != 0 or H % HV != 0:
+            raise ValueError(f"Number of heads in q/k ({HQ}) and v/beta/g ({HV}) must be divisible by each other.")
+        if HQ < H:
+            q = q.repeat_interleave(H // HQ, dim=1)
+            k = k.repeat_interleave(H // HQ, dim=1)
+        if HV < H:
+            v = v.repeat_interleave(H // HV, dim=1)
+            beta = beta.repeat_interleave(H // HV, dim=1)
+            g = g.repeat_interleave(H // HV, dim=1)
 
     T = q.shape[-2]
     pad_len = (BT - (T % BT)) % BT

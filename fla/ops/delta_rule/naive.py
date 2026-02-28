@@ -5,6 +5,21 @@ from einops import rearrange
 
 def delta_rule_recurrence(q, k, v, beta, initial_state=None, output_final_state=True):
     orig_dtype = q.dtype
+
+    HQ = q.shape[1]
+    HV = v.shape[1]
+    H = max(HQ, HV)
+    if HQ != HV:
+        if H % HQ != 0 or H % HV != 0:
+            raise ValueError(f"Number of heads in q/k ({HQ}) and v/beta ({HV}) must be divisible by each other.")
+        if HQ < H:
+            q = q.repeat_interleave(H // HQ, dim=1)
+            k = k.repeat_interleave(H // HQ, dim=1)
+        if HV < H:
+            v = v.repeat_interleave(H // HV, dim=1)
+            if beta.ndim == 3 or (beta.ndim == 4 and beta.shape[-1] == 1):
+                beta = beta.repeat_interleave(H // HV, dim=1)
+
     b, h, l, d_k = q.shape
     q, k, v, beta = map(lambda x: x.float(), [q, k, v, beta])
     d_v = v.shape[-1]
@@ -32,6 +47,20 @@ def delta_rule_recurrence(q, k, v, beta, initial_state=None, output_final_state=
 
 
 def delta_rule_chunkwise(q, k, v, beta, chunk_size=32):
+    HQ = q.shape[1]
+    HV = v.shape[1]
+    H = max(HQ, HV)
+    if HQ != HV:
+        if H % HQ != 0 or H % HV != 0:
+            raise ValueError(f"Number of heads in q/k ({HQ}) and v/beta ({HV}) must be divisible by each other.")
+        if HQ < H:
+            q = q.repeat_interleave(H // HQ, dim=1)
+            k = k.repeat_interleave(H // HQ, dim=1)
+        if HV < H:
+            v = v.repeat_interleave(H // HV, dim=1)
+            if beta.ndim == 3 or (beta.ndim == 4 and beta.shape[-1] == 1):
+                beta = beta.repeat_interleave(H // HV, dim=1)
+
     b, h, l, d_k = q.shape
     d_v = v.shape[-1]
     q = q * (d_k ** -0.5)
@@ -65,6 +94,20 @@ def delta_rule_chunkwise(q, k, v, beta, chunk_size=32):
 
 
 def delta_rule_parallel(q, k, v, beta, BM=128, BN=32):
+    HQ = q.shape[1]
+    HV = v.shape[1]
+    H = max(HQ, HV)
+    if HQ != HV:
+        if H % HQ != 0 or H % HV != 0:
+            raise ValueError(f"Number of heads in q/k ({HQ}) and v/beta ({HV}) must be divisible by each other.")
+        if HQ < H:
+            q = q.repeat_interleave(H // HQ, dim=1)
+            k = k.repeat_interleave(H // HQ, dim=1)
+        if HV < H:
+            v = v.repeat_interleave(H // HV, dim=1)
+            if beta.ndim == 3 or (beta.ndim == 4 and beta.shape[-1] == 1):
+                beta = beta.repeat_interleave(H // HV, dim=1)
+
     b, h, l, d_k = q.shape
     # d_v = v.shape[-1]
     q = q * (d_k ** -0.5)
